@@ -1,0 +1,4 @@
+logistic_regression_model_spark/
+
+spark/chk/
+spark/__pycache__/
