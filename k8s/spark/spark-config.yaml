@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-config
+  namespace: spark
+data:
+  spark-defaults.conf: |
+    spark.master                     k8s://https://kubernetes.default.svc
+    spark.submit.deployMode          cluster
+    spark.kubernetes.container.image apache/spark:3.5.2

@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo-express
+  namespace: mongodb
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: mongo-express
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: mongo-express
+    spec:
+      containers:
+        - env:
+            - name: ME_CONFIG_MONGODB_ADMINUSERNAME
+              value: admin
+            - name: ME_CONFIG_MONGODB_ADMINPASSWORD
+              value: admin123
+            - name: ME_CONFIG_MONGODB_SERVER
+              value: mongodb-service.mongodb.svc.cluster.local
+            - name: ME_CONFIG_MONGODB_AUTH_DATABASE
+              value: admin
+          image: mongo-express:1.0.0
+          imagePullPolicy: IfNotPresent
+          name: mongo-express
+          ports:
+            - containerPort: 8081
+              protocol: TCP
