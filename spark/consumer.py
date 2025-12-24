@@ -13,22 +13,27 @@ from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 from EmptyStringFilter import EmptyStringFilter
 from pyspark.sql.functions import count, window
 from pymongo import UpdateOne
-from pyspark.sql.functions import to_date, current_date
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  
 
 # Establish connection to MongoDB
-client = MongoClient('localhost', 27017)
-db = client['bigdata_project'] 
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 
 
-def write_windowed_to_mongo(df, batch_id):
+def write_windowed_1hour_to_mongo(df, batch_id):
     # Chuyển đổi sang Pandas và xử lý cột window
     # Vì window là struct, ta cần convert để nó thân thiện với Mongo
+    
     pdf = df.toPandas()
         
     if pdf.empty:
         return
-
-    collection = db["windowed_result"]
+    client = MongoClient('localhost', 27017)
+    db = client['bigdata_project'] 
+    collection = db["windowed_results_1hour"]
 
     operations = []
     
@@ -62,13 +67,65 @@ def write_windowed_to_mongo(df, batch_id):
 
     if operations:
         collection.bulk_write(operations)
+    client.close()
     
     
+def write_windowed_5min_to_mongo(df, batch_id):
+    # Chuyển đổi sang Pandas và xử lý cột window
+    # Vì window là struct, ta cần convert để nó thân thiện với Mongo
+    
+    pdf = df.toPandas()
+        
+    if pdf.empty:
+        return
+    client = MongoClient('localhost', 27017)
+    db = client['bigdata_project'] 
+    collection = db["windowed_results_5min"]
+
+    operations = []
+    
+    for _, row in pdf.iterrows():
+        # Lấy thời gian bắt đầu và kết thúc của window
+        window_start = row['window_start']
+        window_end = row['window_end']
+        
+        # Tiêu chí định danh duy nhất (Unique Key)
+        # Một record là duy nhất nếu trùng: Start Time + topic + Sentiment
+        filter_criteria = {
+            "window_start": window_start,
+            "topic": row["topic"],
+        }
+        
+        # Dữ liệu cập nhật
+        update_data = {
+            "$set": {
+                "topic": row["topic"],
+                "window_start": window_start,
+                "window_end": window_end,
+                "total_mentions": int(row["total_mentions"]), # Đảm bảo là kiểu int
+                "positive": int(row["positive"]),
+                "neutral": int(row["neutral"]), 
+                "negative": int(row["negative"]),
+                "sentiment_score": float(row["sentiment_score"]),
+            }
+        }
+        
+        operations.append(UpdateOne(filter_criteria, update_data, upsert=True))
+
+    if operations:
+        collection.bulk_write(operations)
+    client.close()
+
 # 1. Tạo SparkSession
 def create_spark():
     spark = (
         SparkSession.builder
         .appName("SocialStreamSentiment")
+        .config("spark.hadoop.fs.s3a.endpoint", "http://34.44.49.190:30900")
+        .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
         .getOrCreate()
     )
     return spark
@@ -160,17 +217,76 @@ def main():
         """)
     )
     
-    df = with_sentiment_df.select(
+    df_raw = with_sentiment_df.select(
+        "id",
+        "topic",
+        "Text",
+        "event_time_ts",
+        "sentiment_label"
+    )
+    minio_query = (
+        df_raw
+        .writeStream
+        .outputMode("append")
+        .format("parquet")
+        .option("path", "s3a://buck1/sentiment/")
+        .option("checkpointLocation", "s3a://buck1/chk/sentiment/")
+        .start()
+    )
+    
+
+    df = df_raw.select(
         "topic",
         "event_time_ts",
         "sentiment_label"
     )
 
-    result_df = (
+
+    result_df_5_min = (
         df
         .withWatermark("event_time_ts", "15 minutes")
         .groupBy(
             window(col("event_time_ts"), "5 minutes"),
+            col("topic")
+        )
+        .agg(
+            sum(when(col("sentiment_label") == "Positive", 1).otherwise(0)).alias("positive"),
+            sum(when(col("sentiment_label") == "Neutral", 1).otherwise(0)).alias("neutral"),
+            sum(when(col("sentiment_label") == "Negative", 1).otherwise(0)).alias("negative")
+        )
+        .withColumn(
+            "total_mentions",
+            col("positive") + col("neutral") + col("negative")
+        )
+        .withColumn(
+            "sentiment_score",
+            expr("""
+                CASE
+                    WHEN total_mentions = 0 THEN 0
+                    ELSE (positive - negative) / total_mentions
+                END
+            """)
+        )
+        .withColumn("window_start", col("window.start"))
+        .withColumn("window_end", col("window.end"))
+        .drop("window")
+        .select(
+            "window_start",
+            "window_end",
+            "topic",
+            "total_mentions",
+            "positive",
+            "neutral",
+            "negative",
+            "sentiment_score"
+        )
+    )
+
+    result_df_1hour = (
+        df
+        .withWatermark("event_time_ts", "2 hours")
+        .groupBy(
+            window(col("event_time_ts"), "1 hour"),
             col("topic")
         )
         .agg(
@@ -218,17 +334,22 @@ def main():
     #     .start()
     # )
 
-
-    mongo_windowed_query = (
-        result_df.writeStream
-        .foreachBatch(write_windowed_to_mongo)
+    mongo_windowed_1hour_query = (
+        result_df_1hour.writeStream
+        .foreachBatch(write_windowed_1hour_to_mongo)
         .outputMode("update")
-        .option("checkpointLocation", "./chk/windowed_sentiment")
+        .option("checkpointLocation", "./chk/windowed_sentiment_1hour")
         .start()
     )
-    mongo_windowed_query.awaitTermination()
 
-    client.close()
+    mongo_windowed_5min_query = (
+        result_df_5_min.writeStream
+        .foreachBatch(write_windowed_5min_to_mongo)
+        .outputMode("update")
+        .option("checkpointLocation", "./chk/windowed_sentiment_5min")
+        .start()
+    )
+    spark.streams.awaitAnyTermination()
     # console_query.awaitTermination()
 
 
