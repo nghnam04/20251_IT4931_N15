@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   kafka:
@@ -24,5 +24,34 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
 
+  spark:
+    image: apache/spark:3.4.1
+    container_name: spark
+    user: root
+    depends_on:
+      - kafka
+      - mongodb
+    environment:
+      SPARK_MASTER_HOST: spark
+      SPARK_MASTER_PORT: 7077
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: ["/bin/bash", "-c", "while true; do sleep 1000; done"]
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: bigdata_project
+    volumes:
+      - mongo_data:/data/db
+
 volumes:
   kafka_data:
+  mongo_data:
