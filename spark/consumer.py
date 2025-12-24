@@ -38,15 +38,16 @@ def write_windowed_to_mongo(df, batch_id):
         window_end = row['window_end']
         
         # Tiêu chí định danh duy nhất (Unique Key)
-        # Một record là duy nhất nếu trùng: Start Time + Topic + Sentiment
+        # Một record là duy nhất nếu trùng: Start Time + topic + Sentiment
         filter_criteria = {
             "window_start": window_start,
-            "Topic": row["Topic"],
+            "topic": row["topic"],
         }
         
         # Dữ liệu cập nhật
         update_data = {
             "$set": {
+                "topic": row["topic"],
                 "window_start": window_start,
                 "window_end": window_end,
                 "total_mentions": int(row["total_mentions"]), # Đảm bảo là kiểu int
@@ -105,7 +106,7 @@ def main():
 
     message_schema = StructType([
         StructField("id", StringType(), True),
-        StructField("Topic", StringType(), True),
+        StructField("topic", StringType(), True),
         StructField("Text", StringType(), True),
         StructField("event_time", StringType(), True), 
     ])
@@ -160,7 +161,7 @@ def main():
     )
     
     df = with_sentiment_df.select(
-        "Topic",
+        "topic",
         "event_time_ts",
         "sentiment_label"
     )
@@ -170,7 +171,7 @@ def main():
         .withWatermark("event_time_ts", "15 minutes")
         .groupBy(
             window(col("event_time_ts"), "5 minutes"),
-            col("Topic")
+            col("topic")
         )
         .agg(
             sum(when(col("sentiment_label") == "Positive", 1).otherwise(0)).alias("positive"),
@@ -196,7 +197,7 @@ def main():
         .select(
             "window_start",
             "window_end",
-            "Topic",
+            "topic",
             "total_mentions",
             "positive",
             "neutral",
@@ -233,4 +234,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
