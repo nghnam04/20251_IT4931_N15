@@ -1,0 +1,9 @@
+pyspark
+nltk
+matplotlib
+kafka-python
+pymongo
+seaborn
+streamlit
+plotly
+python-dotenv
