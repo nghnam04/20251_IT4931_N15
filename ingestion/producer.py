@@ -13,9 +13,9 @@ with open("../data/twitter_validation.csv", encoding='utf-8') as f:
     for row in reader:
         data  ={
             'id': row[0],
-            'Topic': row[1],
+            'topic': row[1],
             'Text': row[3],
             'event_time': datetime.now().isoformat()
         }
         producer.send(topic, value = data)
-        time.sleep(2)
+        time.sleep(1)
