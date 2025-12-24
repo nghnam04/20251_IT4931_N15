@@ -8,28 +8,69 @@ from json import loads
 from pymongo import MongoClient
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf
-from pyspark.sql.functions import from_json, expr, current_timestamp, unix_timestamp
+from pyspark.sql.functions import from_json, expr, current_timestamp, unix_timestamp, when, sum
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 from EmptyStringFilter import EmptyStringFilter
+from pyspark.sql.functions import count, window
+from pymongo import UpdateOne
+from pyspark.sql.functions import to_date, current_date
+
 # Establish connection to MongoDB
 client = MongoClient('localhost', 27017)
 db = client['bigdata_project'] 
-collection = db['tweets'] 
 
 
+def write_windowed_to_mongo(df, batch_id):
+    # Chuyển đổi sang Pandas và xử lý cột window
+    # Vì window là struct, ta cần convert để nó thân thiện với Mongo
+    pdf = df.toPandas()
+        
+    if pdf.empty:
+        return
 
+    collection = db["windowed_result"]
+
+    operations = []
+    
+    for _, row in pdf.iterrows():
+        # Lấy thời gian bắt đầu và kết thúc của window
+        window_start = row['window_start']
+        window_end = row['window_end']
+        
+        # Tiêu chí định danh duy nhất (Unique Key)
+        # Một record là duy nhất nếu trùng: Start Time + Topic + Sentiment
+        filter_criteria = {
+            "window_start": window_start,
+            "Topic": row["Topic"],
+        }
+        
+        # Dữ liệu cập nhật
+        update_data = {
+            "$set": {
+                "window_start": window_start,
+                "window_end": window_end,
+                "total_mentions": int(row["total_mentions"]), # Đảm bảo là kiểu int
+                "positive": int(row["positive"]),
+                "neutral": int(row["neutral"]), 
+                "negative": int(row["negative"]),
+                "sentiment_score": float(row["sentiment_score"]),
+            }
+        }
+        
+        operations.append(UpdateOne(filter_criteria, update_data, upsert=True))
+
+    if operations:
+        collection.bulk_write(operations)
+    
+    
 # 1. Tạo SparkSession
 def create_spark():
     spark = (
         SparkSession.builder
         .appName("SocialStreamSentiment")
-        # .master("local[*]")  # bật nếu bạn test local
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("WARN")
     return spark
-
-
 
 def clean_text(text):
     if text is not None:
@@ -118,55 +159,78 @@ def main():
         """)
     )
     
-    # Thêm metainfo để check latency
-    # ingest_time: thời gian Spark nhận message
-    # latency_ms: (ingest_time - event_time) tính bằng ms (nếu có event_time)
-    with_latency_df = (
-        with_sentiment_df
-        .withColumn("ingest_time", current_timestamp())
-        .withColumn(
-            "latency_ms",
-            (unix_timestamp(col("ingest_time")) - unix_timestamp(col("event_time_ts")))
-            * 1000.0
-        )
-    )
-
-    # Chọn các cột cần in/log
-    result_df = with_latency_df.select(
-        "id",
+    df = with_sentiment_df.select(
         "Topic",
-        "Text",
         "event_time_ts",
-        # "ingest_time",
-        # "latency_ms",
         "sentiment_label"
     )
 
-    # Ghi ra console (dùng để kiểm thử) 
-    console_query = (
-        result_df.writeStream
-        .format("console")
-        .outputMode("append")  # streaming từ Kafka thường dùng append
-        .option("truncate", False)
-        .option("numRows", 20)
-        .option("checkpointLocation", "./chk/social_stream_console")  # nhớ tạo thư mục nếu cần
-        .start()
+    result_df = (
+        df
+        .withWatermark("event_time_ts", "15 minutes")
+        .groupBy(
+            window(col("event_time_ts"), "5 minutes"),
+            col("Topic")
+        )
+        .agg(
+            sum(when(col("sentiment_label") == "Positive", 1).otherwise(0)).alias("positive"),
+            sum(when(col("sentiment_label") == "Neutral", 1).otherwise(0)).alias("neutral"),
+            sum(when(col("sentiment_label") == "Negative", 1).otherwise(0)).alias("negative")
+        )
+        .withColumn(
+            "total_mentions",
+            col("positive") + col("neutral") + col("negative")
+        )
+        .withColumn(
+            "sentiment_score",
+            expr("""
+                CASE
+                    WHEN total_mentions = 0 THEN 0
+                    ELSE (positive - negative) / total_mentions
+                END
+            """)
+        )
+        .withColumn("window_start", col("window.start"))
+        .withColumn("window_end", col("window.end"))
+        .drop("window")
+        .select(
+            "window_start",
+            "window_end",
+            "Topic",
+            "total_mentions",
+            "positive",
+            "neutral",
+            "negative",
+            "sentiment_score"
+        )
     )
 
-    # ========== (OPTIONAL) Ghi ra file JSON local ==========
-    # Bật nếu muốn lưu ra file để phân tích thêm
-    # file_query = (
+
+    # Ghi ra console (dùng để kiểm thử) 
+    # console_query = (
     #     result_df.writeStream
-    #     .format("json")
-    #     .option("path", "./output/social_stream")
-    #     .option("checkpointLocation", "./chk/social_stream_file")
-    #     .outputMode("append")
+    #     .format("console")
+    #     .outputMode("append")  # streaming từ Kafka thường dùng append
+    #     .option("truncate", False)
+    #     .option("numRows", 20)
+    #     .option("checkpointLocation", "./chk/social_stream_console")  # nhớ tạo thư mục nếu cần
     #     .start()
     # )
 
-    console_query.awaitTermination()
-    # file_query.awaitTermination()
+
+    mongo_windowed_query = (
+        result_df.writeStream
+        .foreachBatch(write_windowed_to_mongo)
+        .outputMode("update")
+        .option("checkpointLocation", "./chk/windowed_sentiment")
+        .start()
+    )
+    mongo_windowed_query.awaitTermination()
+
+    client.close()
+    # console_query.awaitTermination()
 
 
 if __name__ == "__main__":
     main()
+    
